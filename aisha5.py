@@ -275,7 +275,7 @@ def transcribe_with_gemini(audio_bytes: bytes, lang: str) -> str:
     audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-3-flash-preview",
             contents=[prompt, audio_part],
         )
         transcript = response.text.strip()
