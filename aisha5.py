@@ -1,10 +1,8 @@
 import streamlit as st
 import io
 import base64
-from google import genai
-from google.genai import types
+import requests
 from gtts import gTTS
- 
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -165,7 +163,7 @@ if not GEMINI_API_KEY:
     st.error("⚠️ GEMINI_API_KEY not found. Add it in Streamlit Cloud → Settings → Secrets.")
     st.stop()
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={GEMINI_API_KEY}"
 
 # ─────────────────────────────────────────────
 # QUESTIONS  (multilingual)
@@ -265,7 +263,7 @@ def make_tts(text: str, lang: str) -> bytes:
 
 
 def transcribe_with_gemini(audio_bytes: bytes, lang: str) -> str:
-    """Send browser-recorded audio bytes to Gemini for transcription."""
+    """Send audio to Gemini REST API for transcription — no Google SDK needed."""
     lang_hint = {'en': 'English', 'hi': 'Hindi', 'ar': 'Arabic'}.get(lang, 'English')
     prompt = (
         f"The user is speaking in {lang_hint}. "
@@ -273,13 +271,26 @@ def transcribe_with_gemini(audio_bytes: bytes, lang: str) -> str:
         "Return ONLY the transcript text, no extra commentary. "
         "If the audio is silent or inaudible, return an empty string."
     )
-    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
+    import base64 as _b64
+    audio_b64 = _b64.b64encode(audio_bytes).decode("utf-8")
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {
+                    "inline_data": {
+                        "mime_type": "audio/wav",
+                        "data": audio_b64
+                    }
+                }
+            ]
+        }]
+    }
     try:
-        response = gemini_client.models.generate_content(
-            model="gemini-3-flash-preview",
-            contents=[prompt, audio_part],
-        )
-        transcript = response.text.strip()
+        resp = requests.post(GEMINI_URL, json=payload, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        transcript = result["candidates"][0]["content"]["parts"][0]["text"].strip()
         if len(transcript) < 2 or transcript.lower().startswith("i cannot"):
             return ""
         return transcript
