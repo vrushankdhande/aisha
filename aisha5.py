@@ -1,12 +1,6 @@
 import streamlit as st
-import sounddevice as sd
 import io
-import wave
-import time
-import tempfile
-import os
-import winsound
-import numpy as np
+import base64
 from google import genai
 from google.genai import types
 from gtts import gTTS
@@ -145,19 +139,36 @@ html, body, [class*="css"] {
 .stButton>button:disabled {
     background:#21262d !important;color:#8b949e !important;box-shadow:none !important;
 }
+.instruction-box {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 14px 18px;
+    margin-bottom: 16px;
+    font-size: 0.88rem;
+    color: #8b949e;
+    text-align: center;
+}
+.instruction-box strong { color: #58a6ff; }
 </style>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# CONFIG
+# CONFIG  —  store API key in Streamlit secrets
 # ─────────────────────────────────────────────
-GEMINI_API_KEY = "AIzaSyCPxJ-dWv6YvCSsJVMbYIAvkPcU9czudec"   # ← paste your key here
-SAMPLE_RATE    = 16000
-DURATION       = 5   # seconds to record per turn
+# In Streamlit Cloud → Settings → Secrets, add:
+#   GEMINI_API_KEY = "your-key-here"
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
-# ── Configure Gemini (new google-genai SDK) ──
+if not GEMINI_API_KEY:
+    st.error("⚠️ GEMINI_API_KEY not found. Add it in Streamlit Cloud → Settings → Secrets.")
+    st.stop()
+
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# ─────────────────────────────────────────────
+# QUESTIONS  (multilingual)
+# ─────────────────────────────────────────────
 QUESTIONS = {
     'en': {
         0: "Hi, this is Aisha from Platinum Insurance Broker. Am I speaking with {name}?",
@@ -212,23 +223,24 @@ WRONG_PERSON = {
 SORRY     = {'en': "Sorry, could you repeat that?", 'hi': "माफ करें, दोबारा बोलें?", 'ar': "آسفة، هل يمكنك الإعادة؟"}
 QUICK_ACK = {'en': "Got it, thank you.", 'hi': "समझ गई, धन्यवाद।", 'ar': "فهمت، شكراً."}
 LANG_FLAGS = {'en': '🇬🇧 English', 'hi': '🇮🇳 Hindi', 'ar': '🇦🇪 Arabic'}
+GTTS_LANG  = {'en': 'en', 'hi': 'hi', 'ar': 'ar'}
 
 # ─────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────
 def init_state():
     defaults = {
-        'started': False,
-        'finished': False,
-        'running': False,
         'step': 0,
         'call_lang': 'en',
         'messages': [],
         'collected': {},
-        'status': 'idle',
-        'status_text': 'Ready to start',
-        'stop_flag': False,
-        'caller_name': '',       # ← name entered before the call
+        'caller_name': '',
+        'phase': 'setup',        # setup → speaking → listening → done
+        'current_question': '',
+        'tts_audio': None,       # bytes of current TTS mp3 to autoplay
+        'waiting_for_audio': False,
+        'finished': False,
+        'end_call': False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -237,116 +249,95 @@ def init_state():
 init_state()
 
 # ─────────────────────────────────────────────
-# AUDIO HELPERS
+# HELPERS
 # ─────────────────────────────────────────────
 
-def speak(text, lang=None):
-    """Convert text to speech using gTTS and play via winsound."""
-    lang = lang or st.session_state.call_lang
+def make_tts(text: str, lang: str) -> bytes:
+    """Generate TTS mp3 bytes using gTTS (works on Streamlit Cloud)."""
     clean = (text.replace("*","").replace("#","").replace("`","")
              .replace("\n"," ").replace("  "," ").strip())
-    try:
-        tts = gTTS(text=clean, lang=lang, slow=False)
-        mp3 = tempfile.mktemp(suffix=".mp3")
-        wav = tempfile.mktemp(suffix=".wav")
-        tts.save(mp3)
-        os.system(f'ffmpeg -y -i "{mp3}" "{wav}" -loglevel quiet')
-        if os.path.exists(wav):
-            winsound.PlaySound(wav, winsound.SND_FILENAME)
-            os.remove(wav)
-        if os.path.exists(mp3):
-            os.remove(mp3)
-    except Exception:
-        safe = clean.replace('"','').replace("'",'')
-        os.system(
-            f'powershell -Command "Add-Type -AssemblyName System.Speech; '
-            f'$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; '
-            f'$s.Rate=2; $s.Volume=100; $s.Speak(\\"{safe}\\")"'
-        )
-
-
-def record_audio_wav() -> bytes:
-    """
-    Record DURATION seconds of audio from the microphone.
-    Returns raw PCM bytes wrapped in a WAV container.
-    """
-    frames = []
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='int16') as stream:
-        start = time.time()
-        while time.time() - start < DURATION:
-            data, _ = stream.read(1024)
-            frames.append(data.copy())
-
-    audio_data = np.concatenate(frames)
+    tts = gTTS(text=clean, lang=GTTS_LANG.get(lang, 'en'), slow=False)
     buf = io.BytesIO()
-    with wave.open(buf, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)        # int16 → 2 bytes
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio_data.tobytes())
-    return buf.getvalue()
+    tts.write_to_fp(buf)
+    buf.seek(0)
+    return buf.read()
 
 
-def transcribe_with_gemini(wav_bytes: bytes, lang: str) -> str:
-    """
-    Send raw WAV bytes to Gemini 1.5 Flash for transcription.
-    Gemini natively understands audio; no external STT service needed.
-
-    The prompt instructs Gemini to:
-      • transcribe faithfully in the spoken language
-      • return ONLY the transcript (no extra commentary)
-    """
-    lang_hint = {
-        'en': 'English',
-        'hi': 'Hindi',
-        'ar': 'Arabic',
-    }.get(lang, 'English')
-
+def transcribe_with_gemini(audio_bytes: bytes, lang: str) -> str:
+    """Send browser-recorded audio bytes to Gemini for transcription."""
+    lang_hint = {'en': 'English', 'hi': 'Hindi', 'ar': 'Arabic'}.get(lang, 'English')
     prompt = (
         f"The user is speaking in {lang_hint}. "
         "Transcribe the audio exactly as spoken. "
-        "Return ONLY the transcript text with no extra commentary, "
-        "punctuation marks are fine. If the audio is silent or inaudible, "
-        "return an empty string."
+        "Return ONLY the transcript text, no extra commentary. "
+        "If the audio is silent or inaudible, return an empty string."
     )
-
-    # Build the audio part using the new types API
-    audio_part = types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")
-
+    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-3-flash-preview",
+            model="gemini-1.5-flash",
             contents=[prompt, audio_part],
         )
         transcript = response.text.strip()
-        # Guard against Gemini echoing the prompt or returning noise
         if len(transcript) < 2 or transcript.lower().startswith("i cannot"):
             return ""
         return transcript
     except Exception as e:
-        # Fallback: return empty so the retry logic kicks in
-        print(f"[Gemini STT error] {e}")
+        st.warning(f"Transcription error: {e}")
         return ""
 
 
-def listen_mic() -> str:
-    """Record audio and transcribe it with Gemini."""
-    wav_bytes = record_audio_wav()
-    return transcribe_with_gemini(wav_bytes, st.session_state.call_lang)
+def get_question_text(step: int) -> str:
+    lang = st.session_state.call_lang
+    return QUESTIONS[lang][step].replace(
+        "{name}", st.session_state.caller_name or "you"
+    )
+
+
+def is_negative(text: str) -> bool:
+    lower = text.lower()
+    neg_words = ["no", "nope", "nahi", "nahin", "नहीं", "نه", "لا",
+                 "wrong", "not me", "wrong number", "wrong person"]
+    return any(w in lower for w in neg_words)
+
+
+def detect_lang(text: str):
+    lower = text.lower()
+    if any(w in lower for w in ["hindi", "हिंदी", "हिन्दी"]):
+        return 'hi'
+    if any(w in lower for w in ["arabic", "عربي", "arab"]):
+        return 'ar'
+    return 'en'
+
+
+def add_bot_msg(text: str):
+    st.session_state.messages.append({'role': 'bot', 'text': text})
+
+
+def add_user_msg(text: str):
+    st.session_state.messages.append({'role': 'user', 'text': text})
 
 
 # ─────────────────────────────────────────────
 # UI RENDERERS
 # ─────────────────────────────────────────────
+
 def render_status():
-    s = st.session_state.status
-    dot = {'idle':'dot-idle','speaking':'dot-active','listening':'dot-listen'}.get(s,'dot-idle')
+    phase = st.session_state.phase
+    dot_map = {
+        'setup':     ('dot-idle',   'Ready to start'),
+        'speaking':  ('dot-active', 'Aisha is speaking...'),
+        'listening': ('dot-listen', '🎙️ Your turn — record your answer below'),
+        'done':      ('dot-idle',   'Call completed ✅'),
+    }
+    dot, text = dot_map.get(phase, ('dot-idle', ''))
     lang_label = LANG_FLAGS.get(st.session_state.call_lang, '')
     return f'''<div class="status-bar">
         <span class="{dot}"></span>
-        <span>{st.session_state.status_text}</span>
+        <span>{text}</span>
         <span class="lang-badge">{lang_label}</span>
     </div>'''
+
 
 def render_progress():
     step = st.session_state.step
@@ -356,8 +347,9 @@ def render_progress():
     )
     return f'<div class="step-progress">{dots}</div>'
 
+
 def render_chat():
-    html = '<div class="chat-container">'
+    html = '<div class="chat-container" id="chat-bottom">'
     for msg in st.session_state.messages:
         if msg['role'] == 'bot':
             html += f'''<div class="msg-bot">
@@ -372,6 +364,7 @@ def render_chat():
     html += '</div>'
     return html
 
+
 def render_summary():
     rows = ''.join(
         f'<div class="summary-row"><span class="summary-key">{k}</span>'
@@ -380,112 +373,22 @@ def render_summary():
     )
     return f'<div class="summary-card"><h3>📋 Call Summary</h3>{rows}</div>'
 
-# ─────────────────────────────────────────────
-# FULL CALL LOOP
-# ─────────────────────────────────────────────
-def run_full_call(chat_ph, status_ph, progress_ph):
-    """Runs all questions from current step to end, updating UI live."""
 
-    for step in range(st.session_state.step, 9):
-        if st.session_state.get('stop_flag', False):
-            break
+def play_tts(text: str):
+    """Render TTS audio player — browser autoplays it."""
+    lang = st.session_state.call_lang
+    audio_bytes = make_tts(text, lang)
+    # Encode to base64 for inline autoplay HTML
+    b64 = base64.b64encode(audio_bytes).decode()
+    autoplay_html = f"""
+    <audio autoplay style="display:none">
+        <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+    </audio>
+    """
+    st.markdown(autoplay_html, unsafe_allow_html=True)
+    # Also show a visible player as fallback
+    st.audio(audio_bytes, format="audio/mp3")
 
-        st.session_state.step = step
-        lang     = st.session_state.call_lang
-        question = QUESTIONS[lang][step].replace(
-            "{name}", st.session_state.get('caller_name', 'you')
-        )
-
-        # ── Bot asks question ──
-        st.session_state.messages.append({'role': 'bot', 'text': question})
-        st.session_state.status      = 'speaking'
-        st.session_state.status_text = f'Aisha is speaking... (Q{step+1}/9)'
-        status_ph.markdown(render_status(),   unsafe_allow_html=True)
-        progress_ph.markdown(render_progress(), unsafe_allow_html=True)
-        chat_ph.markdown(render_chat(),       unsafe_allow_html=True)
-        speak(question, lang)
-
-        # ── Listen via Gemini ──
-        st.session_state.status      = 'listening'
-        st.session_state.status_text = f'🎙️ Listening... speak now (Q{step+1}/9)'
-        status_ph.markdown(render_status(), unsafe_allow_html=True)
-        user_input = listen_mic()
-
-        # ── Retry once if silent / inaudible ──
-        if not user_input:
-            st.session_state.messages.append({'role': 'bot', 'text': SORRY[lang]})
-            chat_ph.markdown(render_chat(), unsafe_allow_html=True)
-            speak(SORRY[lang], lang)
-            st.session_state.status_text = '🎙️ Listening again...'
-            status_ph.markdown(render_status(), unsafe_allow_html=True)
-            user_input = listen_mic()
-
-        # ── Process answer ──
-        if user_input:
-            st.session_state.messages.append({'role': 'user', 'text': user_input})
-
-            # ── Q0: Check if we reached the right person ──
-            if step == 0:
-                lower = user_input.lower()
-                negative_words = [
-                    "no", "nope", "nahi", "nahin", "नहीं", "نه", "لا",
-                    "wrong", "not alia", "not me", "wrong number", "wrong person"
-                ]
-                is_negative = any(w in lower for w in negative_words)
-                if is_negative:
-                    wrong_msg = WRONG_PERSON[st.session_state.call_lang].replace(
-                        "{name}", st.session_state.get('caller_name', 'the person')
-                    )
-                    st.session_state.messages.append({'role': 'bot', 'text': wrong_msg})
-                    st.session_state.collected["Name Confirmed"] = "No — Wrong person"
-                    chat_ph.markdown(render_chat(), unsafe_allow_html=True)
-                    speak(wrong_msg, st.session_state.call_lang)
-                    # End call immediately
-                    st.session_state.finished    = True
-                    st.session_state.running     = False
-                    st.session_state.status      = 'idle'
-                    st.session_state.status_text = 'Call ended — wrong person'
-                    status_ph.markdown(render_status(), unsafe_allow_html=True)
-                    return   # ← exit the loop entirely
-
-            # Detect preferred language after Q2 (step index 2)
-            if step == 2:
-                lower = user_input.lower()
-                if any(w in lower for w in ["hindi", "हिंदी", "हिन्दी"]):
-                    st.session_state.call_lang = 'hi'
-                elif any(w in lower for w in ["arabic", "عربي", "arab"]):
-                    st.session_state.call_lang = 'ar'
-                else:
-                    st.session_state.call_lang = 'en'
-
-            # Save answer
-            st.session_state.collected[QUESTION_LABELS[step]] = user_input
-
-            # Acknowledge
-            ack = QUICK_ACK[st.session_state.call_lang]
-            st.session_state.messages.append({'role': 'bot', 'text': ack})
-            chat_ph.markdown(render_chat(), unsafe_allow_html=True)
-            speak(ack, st.session_state.call_lang)
-        else:
-            st.session_state.collected[QUESTION_LABELS[step]] = "—"
-
-        # Advance step
-        st.session_state.step = step + 1
-        progress_ph.markdown(render_progress(), unsafe_allow_html=True)
-        chat_ph.markdown(render_chat(), unsafe_allow_html=True)
-
-    # ── Farewell ──
-    farewell = FAREWELL[st.session_state.call_lang]
-    st.session_state.messages.append({'role': 'bot', 'text': farewell})
-    chat_ph.markdown(render_chat(), unsafe_allow_html=True)
-    speak(farewell, st.session_state.call_lang)
-
-    st.session_state.finished    = True
-    st.session_state.running     = False
-    st.session_state.stop_flag   = False
-    st.session_state.status      = 'idle'
-    st.session_state.status_text = 'Call completed ✅'
-    status_ph.markdown(render_status(), unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
 # HEADER
@@ -499,81 +402,184 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# DYNAMIC UI PLACEHOLDERS
+# MAIN APP FLOW
 # ─────────────────────────────────────────────
-status_ph   = st.empty()
-progress_ph = st.empty()
-chat_ph     = st.empty()
-summary_ph  = st.empty()
 
-# Initial render
-status_ph.markdown(render_status(), unsafe_allow_html=True)
-if st.session_state.messages:
-    progress_ph.markdown(render_progress(), unsafe_allow_html=True)
-    chat_ph.markdown(render_chat(), unsafe_allow_html=True)
-if st.session_state.finished:
-    summary_ph.markdown(render_summary(), unsafe_allow_html=True)
+# ── PHASE: SETUP ── enter name, then start
+if st.session_state.phase == 'setup':
+    st.markdown(render_status(), unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# NAME INPUT + CALL CONTROLS
-# ─────────────────────────────────────────────
-col1, col2 = st.columns(2)
-
-with col1:
-    # ── Pre-call: show name input then Start button ──
-    if not st.session_state.started and not st.session_state.finished:
-
-        # Name input field
+    col1, col2 = st.columns([3, 2])
+    with col1:
         entered_name = st.text_input(
             "👤 Person's name to call",
             value=st.session_state.caller_name,
             placeholder="e.g. Alia, Riya, Sara...",
             max_chars=40,
-            key="name_input_field",
         )
-
-        # Sync typed value into session state immediately
         st.session_state.caller_name = entered_name.strip()
 
-        # Start button — only enabled when a name has been typed
+    with col2:
+        st.markdown("<br>", unsafe_allow_html=True)
         name_ready = bool(st.session_state.caller_name)
-        start_disabled = not name_ready
-
-        if st.button(
-            "📞 Start Call",
-            use_container_width=True,
-            disabled=start_disabled,
-        ):
-            st.session_state.started   = True
-            st.session_state.running   = True
-            st.session_state.stop_flag = False
-            run_full_call(chat_ph, status_ph, progress_ph)
-            summary_ph.markdown(render_summary(), unsafe_allow_html=True)
+        if st.button("📞 Start Call", use_container_width=True, disabled=not name_ready):
+            # Prepare first question
+            q = get_question_text(0)
+            add_bot_msg(q)
+            st.session_state.phase = 'speaking'
+            st.session_state.current_question = q
             st.rerun()
 
-        if not name_ready:
-            st.markdown(
-                '<p style="color:#8b949e;font-size:0.82rem;margin-top:6px;">'
-                '⬆️ Enter a name above to enable the call button.</p>',
-                unsafe_allow_html=True,
-            )
+    if not st.session_state.caller_name:
+        st.markdown(
+            '<p style="color:#8b949e;font-size:0.82rem;margin-top:4px;">'
+            '⬆️ Enter a name to enable the call button.</p>',
+            unsafe_allow_html=True
+        )
 
-    # ── Post-call: new call button ──
-    elif st.session_state.finished:
-        if st.button("🔄 Start New Call", use_container_width=True):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
+# ── PHASE: SPEAKING — Aisha speaks, then we wait for user mic input
+elif st.session_state.phase == 'speaking':
+    st.markdown(render_status(), unsafe_allow_html=True)
+    if st.session_state.messages:
+        st.markdown(render_progress(), unsafe_allow_html=True)
+        st.markdown(render_chat(), unsafe_allow_html=True)
+
+    # Play current question TTS
+    q = st.session_state.current_question
+    if q:
+        st.markdown("**🔊 Aisha says:**")
+        play_tts(q)
+
+    st.markdown("""
+    <div class="instruction-box">
+        🎧 Listen to Aisha above, then click <strong>▶ Move to recording</strong> when ready to speak.
+    </div>
+    """, unsafe_allow_html=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🎙️ Ready — Record my answer", use_container_width=True):
+            st.session_state.phase = 'listening'
             st.rerun()
-
-with col2:
-    if st.session_state.started and not st.session_state.finished:
+    with col2:
         if st.button("📵 End Call", use_container_width=True):
-            st.session_state.stop_flag = True
-            farewell = FAREWELL[st.session_state.call_lang]
-            st.session_state.messages.append({'role': 'bot', 'text': farewell})
-            speak(farewell, st.session_state.call_lang)
-            st.session_state.finished    = True
-            st.session_state.running     = False
-            st.session_state.status      = 'idle'
-            st.session_state.status_text = 'Call ended by user'
+            lang = st.session_state.call_lang
+            farewell = FAREWELL[lang]
+            add_bot_msg(farewell)
+            st.session_state.phase = 'done'
+            st.session_state.finished = True
             st.rerun()
+
+# ── PHASE: LISTENING — user records via st.audio_input
+elif st.session_state.phase == 'listening':
+    st.markdown(render_status(), unsafe_allow_html=True)
+    if st.session_state.messages:
+        st.markdown(render_progress(), unsafe_allow_html=True)
+        st.markdown(render_chat(), unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="instruction-box">
+        🎙️ Click the mic below, speak your answer clearly, then click <strong>Stop</strong>.
+        Hit <strong>Submit Answer</strong> when done.
+    </div>
+    """, unsafe_allow_html=True)
+
+    audio = st.audio_input("🎤 Record your answer")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        submit_disabled = audio is None
+        if st.button("✅ Submit Answer", use_container_width=True, disabled=submit_disabled):
+            step = st.session_state.step
+            lang = st.session_state.call_lang
+
+            # Transcribe with Gemini
+            with st.spinner("Transcribing with Gemini..."):
+                audio_bytes = audio.read()
+                transcript = transcribe_with_gemini(audio_bytes, lang)
+
+            if not transcript:
+                # Retry prompt — stay in listening phase
+                sorry = SORRY[lang]
+                add_bot_msg(sorry)
+                st.session_state.current_question = sorry
+                st.session_state.phase = 'speaking'
+                st.rerun()
+            else:
+                add_user_msg(transcript)
+
+                # ── Q0: Wrong person check ──
+                if step == 0 and is_negative(transcript):
+                    wrong_msg = WRONG_PERSON[lang].replace(
+                        "{name}", st.session_state.caller_name or "the person"
+                    )
+                    add_bot_msg(wrong_msg)
+                    st.session_state.collected["Name Confirmed"] = "No — Wrong person"
+                    st.session_state.phase = 'done'
+                    st.session_state.finished = True
+                    st.session_state.current_question = wrong_msg
+                    st.rerun()
+
+                # ── Q2: Detect preferred language ──
+                if step == 2:
+                    st.session_state.call_lang = detect_lang(transcript)
+                    lang = st.session_state.call_lang
+
+                # Save answer
+                st.session_state.collected[QUESTION_LABELS[step]] = transcript
+
+                # Acknowledge
+                ack = QUICK_ACK[lang]
+                add_bot_msg(ack)
+
+                # Advance step
+                next_step = step + 1
+                st.session_state.step = next_step
+
+                if next_step >= 9:
+                    # All questions done
+                    farewell = FAREWELL[lang]
+                    add_bot_msg(farewell)
+                    st.session_state.current_question = farewell
+                    st.session_state.phase = 'done'
+                    st.session_state.finished = True
+                else:
+                    # Next question
+                    next_q = get_question_text(next_step)
+                    add_bot_msg(next_q)
+                    st.session_state.current_question = next_q
+                    st.session_state.phase = 'speaking'
+
+                st.rerun()
+
+    with col2:
+        if st.button("📵 End Call", use_container_width=True):
+            lang = st.session_state.call_lang
+            farewell = FAREWELL[lang]
+            add_bot_msg(farewell)
+            st.session_state.current_question = farewell
+            st.session_state.phase = 'done'
+            st.session_state.finished = True
+            st.rerun()
+
+# ── PHASE: DONE
+elif st.session_state.phase == 'done':
+    st.markdown(render_status(), unsafe_allow_html=True)
+    if st.session_state.messages:
+        st.markdown(render_progress(), unsafe_allow_html=True)
+        st.markdown(render_chat(), unsafe_allow_html=True)
+
+    # Play final TTS (farewell or wrong-person)
+    final_msg = st.session_state.current_question
+    if final_msg:
+        st.markdown("**🔊 Aisha says:**")
+        play_tts(final_msg)
+
+    st.markdown(render_summary(), unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("🔄 Start New Call", use_container_width=True):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
