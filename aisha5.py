@@ -2,7 +2,6 @@ import streamlit as st
 import io
 import base64
 import requests
-from gtts import gTTS
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -222,7 +221,6 @@ WRONG_PERSON = {
 SORRY     = {'en': "Sorry, could you repeat that?", 'hi': "माफ करें, दोबारा बोलें?", 'ar': "آسفة، هل يمكنك الإعادة؟"}
 QUICK_ACK = {'en': "Got it, thank you.", 'hi': "समझ गई, धन्यवाद।", 'ar': "فهمت، شكراً."}
 LANG_FLAGS = {'en': '🇬🇧 English', 'hi': '🇮🇳 Hindi', 'ar': '🇦🇪 Arabic'}
-GTTS_LANG  = {'en': 'en', 'hi': 'hi', 'ar': 'ar'}
 
 # ─────────────────────────────────────────────
 # SESSION STATE
@@ -251,15 +249,9 @@ init_state()
 # HELPERS
 # ─────────────────────────────────────────────
 
-def make_tts(text: str, lang: str) -> bytes:
-    """Generate TTS mp3 bytes using gTTS (works on Streamlit Cloud)."""
-    clean = (text.replace("*","").replace("#","").replace("`","")
-             .replace("\n"," ").replace("  "," ").strip())
-    tts = gTTS(text=clean, lang=GTTS_LANG.get(lang, 'en'), slow=False)
-    buf = io.BytesIO()
-    tts.write_to_fp(buf)
-    buf.seek(0)
-    return buf.read()
+def make_tts(text: str, lang: str):
+    """No-op — TTS is handled by browser Web Speech API in play_tts()."""
+    pass
 
 
 def transcribe_with_gemini(audio_bytes: bytes, lang: str) -> str:
@@ -387,19 +379,32 @@ def render_summary():
 
 
 def play_tts(text: str):
-    """Render TTS audio player — browser autoplays it."""
+    """Speak text using the browser's built-in Web Speech API — zero dependencies."""
     lang = st.session_state.call_lang
-    audio_bytes = make_tts(text, lang)
-    # Encode to base64 for inline autoplay HTML
-    b64 = base64.b64encode(audio_bytes).decode()
-    autoplay_html = f"""
-    <audio autoplay style="display:none">
-        <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
-    </audio>
+    lang_map = {'en': 'en-US', 'hi': 'hi-IN', 'ar': 'ar-SA'}
+    bcp_lang = lang_map.get(lang, 'en-US')
+    # Escape for JS string
+    safe_text = text.replace("\\", "").replace("`", "'").replace('"', "'").replace("\n", " ")
+    js = f"""
+    <script>
+    (function() {{
+        window.speechSynthesis.cancel();
+        var u = new SpeechSynthesisUtterance(`{safe_text}`);
+        u.lang = '{bcp_lang}';
+        u.rate = 1.0;
+        u.pitch = 1.0;
+        u.volume = 1.0;
+        // Pick a voice matching the language if available
+        var voices = window.speechSynthesis.getVoices();
+        var match = voices.find(v => v.lang.startsWith('{bcp_lang[:2]}'));
+        if (match) u.voice = match;
+        window.speechSynthesis.speak(u);
+    }})();
+    </script>
     """
-    st.markdown(autoplay_html, unsafe_allow_html=True)
-    # Also show a visible player as fallback
-    st.audio(audio_bytes, format="audio/mp3")
+    st.markdown(js, unsafe_allow_html=True)
+    # Show text so user can read along while browser speaks
+    st.info(f"🔊 {text}")
 
 
 # ─────────────────────────────────────────────
