@@ -1,7 +1,7 @@
 import streamlit as st
 import io
 import base64
-from google import genai
+import google.genai as genai
 from google.genai import types
 from gtts import gTTS
 
