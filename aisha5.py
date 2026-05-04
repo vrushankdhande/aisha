@@ -375,7 +375,7 @@ startRecording();
 </html>
 """
     # Render the recorder inside an iframe-like component
-    st.components.v1.html(recorder_html, height=240)
+    st.iframe(recorder_html, height=240)
 
 
 # ─────────────────────────────────────────────
