@@ -1,11 +1,19 @@
 import streamlit as st
-import requests
+import io
 import base64
+import requests
+import tempfile
+import os
+from gtts import gTTS
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
 # ─────────────────────────────────────────────
-st.set_page_config(page_title="Aisha — Platinum Insurance", page_icon="🛡️", layout="centered")
+st.set_page_config(
+    page_title="Aisha — Platinum Insurance",
+    page_icon="🛡️",
+    layout="centered"
+)
 
 # ─────────────────────────────────────────────
 # CSS
@@ -24,7 +32,7 @@ html,body,[class*="css"]{font-family:'DM Sans',sans-serif;background-color:#0d11
 .dot-active{width:10px;height:10px;border-radius:50%;background:#3fb950;display:inline-block;animation:pulse 1.2s infinite;}
 .dot-listen{width:10px;height:10px;border-radius:50%;background:#f78166;display:inline-block;animation:pulse 0.7s infinite;}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
-.chat-container{background:#0d1117;border:1px solid #21262d;border-radius:14px;padding:20px;min-height:260px;max-height:400px;overflow-y:auto;margin-bottom:20px;}
+.chat-container{background:#0d1117;border:1px solid #21262d;border-radius:14px;padding:20px;min-height:320px;max-height:460px;overflow-y:auto;margin-bottom:20px;}
 .msg-bot{display:flex;align-items:flex-start;gap:12px;margin-bottom:16px;}
 .msg-bot .avatar{width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,#1f6feb,#388bfd);display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0;}
 .msg-bot .bubble{background:#1c2128;border:1px solid #30363d;border-radius:4px 14px 14px 14px;padding:10px 14px;max-width:80%;font-size:0.92rem;line-height:1.5;color:#e6edf3;}
@@ -108,14 +116,23 @@ WRONG_PERSON = {'en': "I'm sorry to bother you. I was looking for {name}. Have a
 SORRY        = {'en': "Sorry, could you repeat that?", 'hi': "माफ करें, दोबारा बोलें?", 'ar': "آسفة، هل يمكنك الإعادة؟"}
 QUICK_ACK    = {'en': "Got it, thank you.", 'hi': "समझ गई, धन्यवाद।", 'ar': "فهمت، شكراً."}
 LANG_FLAGS   = {'en': '🇬🇧 English', 'hi': '🇮🇳 Hindi', 'ar': '🇦🇪 Arabic'}
+GTTS_LANG    = {'en': 'en', 'hi': 'hi', 'ar': 'ar'}
 
 # ─────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────
 def init_state():
     defaults = {
-        'step': 0, 'call_lang': 'en', 'messages': [], 'collected': {},
-        'caller_name': '', 'phase': 'setup', 'current_question': '', 'finished': False,
+        'step': 0,
+        'call_lang': 'en',
+        'messages': [],
+        'collected': {},
+        'caller_name': '',
+        'phase': 'setup',        # setup → speaking → listening → done
+        'current_question': '',
+        'finished': False,
+        'tts_b64': '',           # base64 MP3 for browser autoplay
+        'tts_key': 0,            # increment to force re-render of audio player
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -126,6 +143,39 @@ init_state()
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
+def make_tts_b64(text: str, lang: str) -> str:
+    """Generate MP3 with gTTS on the server and return base64 string."""
+    tts_lang = GTTS_LANG.get(lang, 'en')
+    clean = text.replace("*","").replace("#","").replace("`","").replace("\n"," ").strip()
+    try:
+        buf = io.BytesIO()
+        tts = gTTS(text=clean, lang=tts_lang, slow=False)
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode("utf-8")
+    except Exception as e:
+        st.warning(f"TTS error: {e}")
+        return ""
+
+def play_tts_in_browser(b64_mp3: str, key: int):
+    """Inject a hidden <audio> tag that autoplays the base64 MP3."""
+    if not b64_mp3:
+        return
+    st.markdown(f"""
+    <audio id="tts-player-{key}" autoplay style="display:none">
+      <source src="data:audio/mp3;base64,{b64_mp3}" type="audio/mp3">
+    </audio>
+    <script>
+    (function(){{
+        var a = document.getElementById('tts-player-{key}');
+        if(a){{
+            a.load();
+            a.play().catch(function(e){{ console.warn('TTS autoplay blocked:', e); }});
+        }}
+    }})();
+    </script>
+    """, unsafe_allow_html=True)
+
 def transcribe_with_gemini(audio_b64: str, lang: str) -> str:
     lang_hint = {'en': 'English', 'hi': 'Hindi', 'ar': 'Arabic'}.get(lang, 'English')
     prompt = (
@@ -147,10 +197,14 @@ def transcribe_with_gemini(audio_b64: str, lang: str) -> str:
         return ""
 
 def get_question_text(step):
-    return QUESTIONS[st.session_state.call_lang][step].replace("{name}", st.session_state.caller_name or "you")
+    return QUESTIONS[st.session_state.call_lang][step].replace(
+        "{name}", st.session_state.caller_name or "you"
+    )
 
 def is_negative(text):
-    return any(w in text.lower() for w in ["no","nope","nahi","nahin","नहीं","نه","لا","wrong","not me","wrong number","wrong person"])
+    return any(w in text.lower() for w in [
+        "no","nope","nahi","nahin","नहीं","نه","لا","wrong","not me","wrong number","wrong person"
+    ])
 
 def detect_lang(text):
     lower = text.lower()
@@ -162,17 +216,25 @@ def add_bot_msg(text):  st.session_state.messages.append({'role':'bot','text':te
 def add_user_msg(text): st.session_state.messages.append({'role':'user','text':text})
 
 # ─────────────────────────────────────────────
-# RENDER HELPERS
+# UI RENDERERS
 # ─────────────────────────────────────────────
 def render_status():
-    dot_map = {'setup':('dot-idle','Ready to start'),'speaking':('dot-active','Aisha is speaking...'),'listening':('dot-listen','🎙️ Recording your answer...'),'done':('dot-idle','Call completed ✅')}
+    dot_map = {
+        'setup':     ('dot-idle',   'Ready to start'),
+        'speaking':  ('dot-active', '🔊 Aisha is speaking...'),
+        'listening': ('dot-listen', '🎙️ Recording your answer...'),
+        'done':      ('dot-idle',   'Call completed ✅'),
+    }
     dot, text = dot_map.get(st.session_state.phase, ('dot-idle',''))
     lang_label = LANG_FLAGS.get(st.session_state.call_lang,'')
     return f'<div class="status-bar"><span class="{dot}"></span><span>{text}</span><span class="lang-badge">{lang_label}</span></div>'
 
 def render_progress():
     step = st.session_state.step
-    dots = ''.join(f'<div class="step-dot {"done" if i<step else "active" if i==step else ""}"></div>' for i in range(9))
+    dots = ''.join(
+        f'<div class="step-dot {"done" if i<step else "active" if i==step else ""}"></div>'
+        for i in range(9)
+    )
     return f'<div class="step-progress">{dots}</div>'
 
 def render_chat():
@@ -185,73 +247,35 @@ def render_chat():
     return html + '</div>'
 
 def render_summary():
-    rows = ''.join(f'<div class="summary-row"><span class="summary-key">{k}</span><span class="summary-val">{v}</span></div>' for k,v in st.session_state.collected.items())
+    rows = ''.join(
+        f'<div class="summary-row"><span class="summary-key">{k}</span><span class="summary-val">{v}</span></div>'
+        for k,v in st.session_state.collected.items()
+    )
     return f'<div class="summary-card"><h3>📋 Call Summary</h3>{rows}</div>'
 
 # ─────────────────────────────────────────────
-# TTS — async voice loading fix
-# ─────────────────────────────────────────────
-def play_tts(text: str):
-    lang = st.session_state.call_lang
-    bcp  = {'en':'en-US','hi':'hi-IN','ar':'ar-SA'}.get(lang,'en-US')
-    safe = text.replace("\\","").replace("`","'").replace('"',"'").replace("\n"," ")
-    st.markdown(f"""
-    <script>
-    (function(){{
-        window.speechSynthesis.cancel();
-        function doSpeak(){{
-            var u=new SpeechSynthesisUtterance(`{safe}`);
-            u.lang='{bcp}';u.rate=1.0;u.pitch=1.05;u.volume=1.0;
-            var voices=window.speechSynthesis.getVoices();
-            var v=voices.find(x=>x.lang==='{bcp}')||voices.find(x=>x.lang.startsWith('{bcp[:2]}'));
-            if(v)u.voice=v;
-            window.speechSynthesis.speak(u);
-        }}
-        if(window.speechSynthesis.getVoices().length>0){{doSpeak();}}
-        else{{
-            window.speechSynthesis.onvoiceschanged=function(){{
-                window.speechSynthesis.onvoiceschanged=null;doSpeak();
-            }};
-            setTimeout(function(){{if(!window.speechSynthesis.speaking)doSpeak();}},600);
-        }}
-    }})();
-    </script>
-    """, unsafe_allow_html=True)
-    st.info(f"🔊 {text}")
-
-# ─────────────────────────────────────────────
-# CUSTOM HTML5 RECORDER COMPONENT
-# Auto-requests mic, records, and passes base64 audio back via query param
+# CUSTOM HTML5 RECORDER — auto-starts mic
+# Sends audio back via postMessage → query param
 # ─────────────────────────────────────────────
 def recorder_component():
-    recorder_html = """
-<!DOCTYPE html>
+    recorder_html = """<!DOCTYPE html>
 <html>
 <head>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: 'DM Sans', 'Segoe UI', sans-serif;
-    background: #161b22; color: #e6edf3;
-    display: flex; align-items: center; justify-content: center;
-    min-height: 220px; padding: 20px;
-  }
-  #wrap { text-align: center; width: 100%; }
-  #status { font-size: 1rem; color: #f78166; margin-bottom: 12px; font-weight: 600; }
-  #timer  { font-size: 2.2rem; font-weight: 700; color: #58a6ff; margin-bottom: 16px; letter-spacing: 3px; }
-  #waveform { display:flex; align-items:flex-end; justify-content:center; gap:5px; height:50px; margin-bottom:20px; }
-  .bar { width:7px; border-radius:4px; background:#58a6ff; transition: height 0.1s; }
-  #stop-btn {
-    background: linear-gradient(135deg,#da3633,#f85149);
-    color: white; border: none; border-radius: 10px;
-    padding: 12px 40px; font-size: 1rem; font-weight: 700;
-    cursor: pointer; box-shadow: 0 4px 14px rgba(218,54,51,0.4);
-    transition: transform 0.1s, opacity 0.2s;
-  }
-  #stop-btn:hover:not(:disabled) { transform: scale(1.04); }
-  #stop-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  #err { color: #f78166; font-size: 0.85rem; margin-top: 14px; }
-  #processing { color: #3fb950; font-size: 0.95rem; margin-top: 14px; display: none; }
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'DM Sans','Segoe UI',sans-serif;background:#161b22;color:#e6edf3;
+     display:flex;align-items:center;justify-content:center;min-height:210px;padding:18px;}
+#wrap{text-align:center;width:100%;}
+#status{font-size:1rem;color:#f78166;margin-bottom:10px;font-weight:600;}
+#timer{font-size:2rem;font-weight:700;color:#58a6ff;margin-bottom:14px;letter-spacing:3px;}
+#waveform{display:flex;align-items:flex-end;justify-content:center;gap:5px;height:48px;margin-bottom:18px;}
+.bar{width:7px;border-radius:4px;background:#58a6ff;}
+#stop-btn{background:linear-gradient(135deg,#da3633,#f85149);color:white;border:none;
+          border-radius:10px;padding:11px 38px;font-size:1rem;font-weight:700;cursor:pointer;
+          box-shadow:0 4px 14px rgba(218,54,51,0.4);transition:transform 0.1s,opacity 0.2s;}
+#stop-btn:hover:not(:disabled){transform:scale(1.04);}
+#stop-btn:disabled{opacity:0.35;cursor:not-allowed;}
+#err{color:#f78166;font-size:0.83rem;margin-top:12px;}
 </style>
 </head>
 <body>
@@ -259,147 +283,88 @@ def recorder_component():
   <div id="status">🎙️ Requesting mic access...</div>
   <div id="timer">0:00</div>
   <div id="waveform">
-    <div class="bar" style="height:8px"></div>
-    <div class="bar" style="height:8px"></div>
-    <div class="bar" style="height:8px"></div>
-    <div class="bar" style="height:8px"></div>
-    <div class="bar" style="height:8px"></div>
-    <div class="bar" style="height:8px"></div>
+    <div class="bar" style="height:8px"></div><div class="bar" style="height:8px"></div>
+    <div class="bar" style="height:8px"></div><div class="bar" style="height:8px"></div>
+    <div class="bar" style="height:8px"></div><div class="bar" style="height:8px"></div>
     <div class="bar" style="height:8px"></div>
   </div>
   <button id="stop-btn" disabled>⏹ Stop &amp; Submit Answer</button>
   <div id="err"></div>
-  <div id="processing">⏳ Submitting... please wait</div>
 </div>
-
 <script>
-var mediaRecorder, chunks=[], timerInt, secs=0, analyser, animFrame, audioCtx;
+var mr,chunks=[],timerInt,secs=0,analyser,animF,actx;
 var statusEl=document.getElementById('status');
 var timerEl=document.getElementById('timer');
 var stopBtn=document.getElementById('stop-btn');
 var errEl=document.getElementById('err');
-var procEl=document.getElementById('processing');
 var bars=document.querySelectorAll('.bar');
 
-function showErr(msg){ errEl.textContent=msg; statusEl.textContent='❌ Error'; stopAnim(); }
+function stopAnim(){if(animF)cancelAnimationFrame(animF);bars.forEach(function(b){b.style.height='8px';b.style.opacity='0.4';});}
 
-function startTimer(){
-  timerInt=setInterval(function(){
-    secs++;
-    var m=Math.floor(secs/60), s=secs%60;
-    timerEl.textContent=m+':'+(s<10?'0':'')+s;
-  },1000);
+function animWave(){
+  if(!analyser)return;
+  var d=new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(d);
+  var step=Math.floor(d.length/bars.length);
+  bars.forEach(function(b,i){var v=d[i*step]||0;b.style.height=(8+Math.round(v/255*40))+'px';b.style.opacity=0.4+(v/255*0.6);});
+  animF=requestAnimationFrame(animWave);
 }
 
-function stopAnim(){
-  if(animFrame) cancelAnimationFrame(animFrame);
-  bars.forEach(function(b){ b.style.height='8px'; b.style.opacity='0.4'; });
-}
-
-function animateWave(){
-  if(!analyser){ return; }
-  var data=new Uint8Array(analyser.frequencyBinCount);
-  analyser.getByteFrequencyData(data);
-  var step=Math.floor(data.length/bars.length);
-  bars.forEach(function(b,i){
-    var val=data[i*step]||0;
-    var h=8+Math.round((val/255)*42);
-    b.style.height=h+'px';
-    b.style.opacity=0.4+(val/255)*0.6;
-  });
-  animFrame=requestAnimationFrame(animateWave);
-}
+function startTimer(){timerInt=setInterval(function(){secs++;var m=Math.floor(secs/60),s=secs%60;timerEl.textContent=m+':'+(s<10?'0':'')+s;},1000);}
 
 function startRecording(){
   navigator.mediaDevices.getUserMedia({audio:true,video:false})
     .then(function(stream){
-      // Live waveform via Web Audio
-      audioCtx=new (window.AudioContext||window.webkitAudioContext)();
-      var src=audioCtx.createMediaStreamSource(stream);
-      analyser=audioCtx.createAnalyser();
-      analyser.fftSize=64;
-      src.connect(analyser);
-      animateWave();
+      actx=new(window.AudioContext||window.webkitAudioContext)();
+      var src=actx.createMediaStreamSource(stream);
+      analyser=actx.createAnalyser();analyser.fftSize=64;
+      src.connect(analyser);animWave();
 
-      // Pick best MIME
       var mime='';
-      ['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4'].forEach(function(t){
-        if(!mime && MediaRecorder.isTypeSupported(t)) mime=t;
-      });
-      mediaRecorder=new MediaRecorder(stream, mime?{mimeType:mime}:{});
-
-      mediaRecorder.ondataavailable=function(e){ if(e.data&&e.data.size>0) chunks.push(e.data); };
-
-      mediaRecorder.onstop=function(){
-        clearInterval(timerInt);
-        stopAnim();
+      ['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4'].forEach(function(t){if(!mime&&MediaRecorder.isTypeSupported(t))mime=t;});
+      mr=new MediaRecorder(stream,mime?{mimeType:mime}:{});
+      mr.ondataavailable=function(e){if(e.data&&e.data.size>0)chunks.push(e.data);};
+      mr.onstop=function(){
+        clearInterval(timerInt);stopAnim();
         stream.getTracks().forEach(function(t){t.stop();});
-        statusEl.textContent='✅ Done! Submitting...';
-        procEl.style.display='block';
-        stopBtn.disabled=true;
-
-        var blob=new Blob(chunks,{type:mediaRecorder.mimeType||'audio/webm'});
+        statusEl.textContent='✅ Submitting...';stopBtn.disabled=true;
+        var blob=new Blob(chunks,{type:mr.mimeType||'audio/webm'});
         var reader=new FileReader();
         reader.onloadend=function(){
           var b64=reader.result.split(',')[1];
-          // Post to parent window (Streamlit) via postMessage
-          window.parent.postMessage({type:'AUDIO_READY', audio_b64: b64}, '*');
+          window.parent.postMessage({type:'AUDIO_READY',audio_b64:b64},'*');
         };
         reader.readAsDataURL(blob);
       };
-
-      mediaRecorder.start(200);
+      mr.start(200);
       statusEl.textContent='🔴 Recording — speak now';
-      stopBtn.disabled=false;
-      startTimer();
+      stopBtn.disabled=false;startTimer();
     })
     .catch(function(err){
-      if(err.name==='NotAllowedError'){
-        showErr('Mic permission denied. Allow mic in browser settings and reload.');
-      } else if(err.name==='NotFoundError'){
-        showErr('No microphone found. Connect a mic and reload.');
-      } else {
-        showErr('Mic error: '+err.message);
-      }
+      stopAnim();
+      errEl.textContent=(err.name==='NotAllowedError')?'Mic permission denied. Please allow mic and reload.':'Mic error: '+err.message;
+      statusEl.textContent='❌ Error';
     });
 }
 
-stopBtn.addEventListener('click',function(){
-  if(mediaRecorder&&mediaRecorder.state!=='inactive') mediaRecorder.stop();
-});
-
-// Start immediately
+stopBtn.addEventListener('click',function(){if(mr&&mr.state!=='inactive')mr.stop();});
 startRecording();
 </script>
 </body>
-</html>
-"""
-    # Render the recorder inside an iframe-like component
-    st.iframe(recorder_html, height=240)
+</html>"""
+    st.components.v1.html(recorder_html, height=230)
 
-
-# ─────────────────────────────────────────────
-# INTERCEPT postMessage from recorder via query param
-# We use a tiny JS bridge injected into the Streamlit page to
-# listen for the AUDIO_READY postMessage and redirect with the param
-# ─────────────────────────────────────────────
 def inject_postmessage_bridge():
-    """
-    Listens for AUDIO_READY postMessage from the recorder iframe
-    and redirects the parent Streamlit page with ?audio_b64=... so
-    Python can read it via st.query_params.
-    """
+    """Listens for AUDIO_READY from recorder iframe → redirects with ?audio_b64=..."""
     st.markdown("""
     <script>
     (function(){
-        if(window._audioBridgeActive) return;
-        window._audioBridgeActive = true;
-        window.addEventListener('message', function(event){
-            if(event.data && event.data.type === 'AUDIO_READY'){
-                var b64 = event.data.audio_b64;
-                // Navigate parent to same page with audio param
-                var base = window.location.href.split('?')[0].split('#')[0];
-                window.location.href = base + '?audio_b64=' + encodeURIComponent(b64);
+        if(window._audioBridgeActive)return;
+        window._audioBridgeActive=true;
+        window.addEventListener('message',function(e){
+            if(e.data&&e.data.type==='AUDIO_READY'){
+                var base=window.location.href.split('?')[0].split('#')[0];
+                window.location.href=base+'?audio_b64='+encodeURIComponent(e.data.audio_b64);
             }
         });
     })();
@@ -418,7 +383,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# PROCESS INCOMING AUDIO FROM QUERY PARAMS
+# PROCESS INCOMING AUDIO (from recorder via query param)
 # ─────────────────────────────────────────────
 incoming_audio = st.query_params.get("audio_b64", "")
 
@@ -431,40 +396,53 @@ if incoming_audio and st.session_state.phase == 'listening':
         transcript = transcribe_with_gemini(incoming_audio, lang)
 
     if not transcript:
+        # Retry — go back to speaking with SORRY message
         sorry = SORRY[lang]
         add_bot_msg(sorry)
         st.session_state.current_question = sorry
+        st.session_state.tts_b64 = make_tts_b64(sorry, lang)
+        st.session_state.tts_key += 1
         st.session_state.phase = 'speaking'
     else:
         add_user_msg(transcript)
 
+        # Q0: wrong person check
         if step == 0 and is_negative(transcript):
             wrong_msg = WRONG_PERSON[lang].replace("{name}", st.session_state.caller_name or "the person")
             add_bot_msg(wrong_msg)
             st.session_state.collected["Name Confirmed"] = "No — Wrong person"
+            st.session_state.tts_b64 = make_tts_b64(wrong_msg, lang)
+            st.session_state.tts_key += 1
+            st.session_state.current_question = wrong_msg
             st.session_state.phase = 'done'
             st.session_state.finished = True
-            st.session_state.current_question = wrong_msg
             st.rerun()
 
+        # Q2: detect preferred language
         if step == 2:
             st.session_state.call_lang = detect_lang(transcript)
             lang = st.session_state.call_lang
 
         st.session_state.collected[QUESTION_LABELS[step]] = transcript
-        add_bot_msg(QUICK_ACK[lang])
+        ack = QUICK_ACK[lang]
+        add_bot_msg(ack)
+
         next_step = step + 1
         st.session_state.step = next_step
 
         if next_step >= 9:
             farewell = FAREWELL[lang]
             add_bot_msg(farewell)
+            st.session_state.tts_b64 = make_tts_b64(farewell, lang)
+            st.session_state.tts_key += 1
             st.session_state.current_question = farewell
             st.session_state.phase = 'done'
             st.session_state.finished = True
         else:
             next_q = get_question_text(next_step)
             add_bot_msg(next_q)
+            st.session_state.tts_b64 = make_tts_b64(next_q, lang)
+            st.session_state.tts_key += 1
             st.session_state.current_question = next_q
             st.session_state.phase = 'speaking'
 
@@ -479,15 +457,22 @@ if st.session_state.phase == 'setup':
     st.markdown(render_status(), unsafe_allow_html=True)
     col1, col2 = st.columns([3,2])
     with col1:
-        entered = st.text_input("👤 Person's name to call", value=st.session_state.caller_name, placeholder="e.g. Alia, Riya, Sara...", max_chars=40)
+        entered = st.text_input(
+            "👤 Person's name to call",
+            value=st.session_state.caller_name,
+            placeholder="e.g. Alia, Riya, Sara...",
+            max_chars=40
+        )
         st.session_state.caller_name = entered.strip()
     with col2:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("📞 Start Call", use_container_width=True, disabled=not st.session_state.caller_name):
             q = get_question_text(0)
             add_bot_msg(q)
-            st.session_state.phase = 'speaking'
             st.session_state.current_question = q
+            st.session_state.tts_b64 = make_tts_b64(q, st.session_state.call_lang)
+            st.session_state.tts_key += 1
+            st.session_state.phase = 'speaking'
             st.rerun()
     if not st.session_state.caller_name:
         st.markdown('<p style="color:#8b949e;font-size:0.82rem;margin-top:4px;">⬆️ Enter a name to enable the call button.</p>', unsafe_allow_html=True)
@@ -499,14 +484,14 @@ elif st.session_state.phase == 'speaking':
         st.markdown(render_progress(), unsafe_allow_html=True)
         st.markdown(render_chat(), unsafe_allow_html=True)
 
-    q = st.session_state.current_question
-    if q:
-        play_tts(q)
+    # ✅ Play gTTS audio via browser autoplay
+    play_tts_in_browser(st.session_state.tts_b64, st.session_state.tts_key)
 
     st.markdown("""
-    <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px 18px;
+    <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:13px 18px;
                 margin-bottom:16px;font-size:0.88rem;color:#8b949e;text-align:center;">
-      🎧 Listen to Aisha above · Click <strong style="color:#58a6ff;">🎙️ I'm Ready to Answer</strong> when done listening
+      🎧 Aisha is speaking above &nbsp;·&nbsp;
+      Click <strong style="color:#58a6ff;">🎙️ I'm Ready to Answer</strong> after you hear the question
     </div>
     """, unsafe_allow_html=True)
 
@@ -517,8 +502,11 @@ elif st.session_state.phase == 'speaking':
             st.rerun()
     with col2:
         if st.button("📵 End Call", use_container_width=True):
-            farewell = FAREWELL[st.session_state.call_lang]
+            lang = st.session_state.call_lang
+            farewell = FAREWELL[lang]
             add_bot_msg(farewell)
+            st.session_state.tts_b64 = make_tts_b64(farewell, lang)
+            st.session_state.tts_key += 1
             st.session_state.current_question = farewell
             st.session_state.phase = 'done'
             st.session_state.finished = True
@@ -526,18 +514,21 @@ elif st.session_state.phase == 'speaking':
 
 # ── LISTENING ──
 elif st.session_state.phase == 'listening':
-    inject_postmessage_bridge()   # listen for audio from recorder iframe
+    inject_postmessage_bridge()
     st.markdown(render_status(), unsafe_allow_html=True)
     if st.session_state.messages:
         st.markdown(render_progress(), unsafe_allow_html=True)
         st.markdown(render_chat(), unsafe_allow_html=True)
 
-    # Custom recorder — auto-starts mic, live waveform, stop button submits
+    # Custom HTML5 recorder — auto-starts mic, live waveform
     recorder_component()
 
     if st.button("📵 End Call", use_container_width=True):
-        farewell = FAREWELL[st.session_state.call_lang]
+        lang = st.session_state.call_lang
+        farewell = FAREWELL[lang]
         add_bot_msg(farewell)
+        st.session_state.tts_b64 = make_tts_b64(farewell, lang)
+        st.session_state.tts_key += 1
         st.session_state.current_question = farewell
         st.session_state.phase = 'done'
         st.session_state.finished = True
@@ -550,9 +541,8 @@ elif st.session_state.phase == 'done':
         st.markdown(render_progress(), unsafe_allow_html=True)
         st.markdown(render_chat(), unsafe_allow_html=True)
 
-    final_msg = st.session_state.current_question
-    if final_msg:
-        play_tts(final_msg)
+    # Play farewell audio
+    play_tts_in_browser(st.session_state.tts_b64, st.session_state.tts_key)
 
     st.markdown(render_summary(), unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
