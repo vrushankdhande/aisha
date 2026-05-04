@@ -154,8 +154,6 @@ html, body, [class*="css"] {
 # ─────────────────────────────────────────────
 # CONFIG  —  store API key in Streamlit secrets
 # ─────────────────────────────────────────────
-# In Streamlit Cloud → Settings → Secrets, add:
-#   GEMINI_API_KEY = "your-key-here"
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
 if not GEMINI_API_KEY:
@@ -232,9 +230,9 @@ def init_state():
         'messages': [],
         'collected': {},
         'caller_name': '',
-        'phase': 'setup',        # setup → speaking → listening → done
+        'phase': 'setup',
         'current_question': '',
-        'tts_audio': None,       # bytes of current TTS mp3 to autoplay
+        'tts_audio': None,
         'waiting_for_audio': False,
         'finished': False,
         'end_call': False,
@@ -249,13 +247,7 @@ init_state()
 # HELPERS
 # ─────────────────────────────────────────────
 
-def make_tts(text: str, lang: str):
-    """No-op — TTS is handled by browser Web Speech API in play_tts()."""
-    pass
-
-
 def transcribe_with_gemini(audio_bytes: bytes, lang: str) -> str:
-    """Send audio to Gemini REST API for transcription — no Google SDK needed."""
     lang_hint = {'en': 'English', 'hi': 'Hindi', 'ar': 'Arabic'}.get(lang, 'English')
     prompt = (
         f"The user is speaking in {lang_hint}. "
@@ -323,6 +315,110 @@ def add_user_msg(text: str):
 
 
 # ─────────────────────────────────────────────
+# FIX 1 — TTS with async voice loading
+# ─────────────────────────────────────────────
+def play_tts(text: str):
+    """Speak text using browser Web Speech API with proper async voice loading."""
+    lang = st.session_state.call_lang
+    lang_map = {'en': 'en-US', 'hi': 'hi-IN', 'ar': 'ar-SA'}
+    bcp_lang = lang_map.get(lang, 'en-US')
+    safe_text = text.replace("\\", "").replace("`", "'").replace('"', "'").replace("\n", " ")
+    js = f"""
+    <script>
+    (function() {{
+        window.speechSynthesis.cancel();
+
+        function speak() {{
+            var u = new SpeechSynthesisUtterance(`{safe_text}`);
+            u.lang = '{bcp_lang}';
+            u.rate = 1.0;
+            u.pitch = 1.05;
+            u.volume = 1.0;
+
+            var voices = window.speechSynthesis.getVoices();
+
+            // Try exact lang match first (e.g. hi-IN), then prefix match (e.g. hi)
+            var match = voices.find(v => v.lang === '{bcp_lang}')
+                     || voices.find(v => v.lang.startsWith('{bcp_lang[:2]}'));
+            if (match) u.voice = match;
+
+            window.speechSynthesis.speak(u);
+        }}
+
+        var voices = window.speechSynthesis.getVoices();
+        if (voices.length > 0) {{
+            // Voices already loaded — speak immediately
+            speak();
+        }} else {{
+            // Wait for voices to load (Chrome requires this)
+            window.speechSynthesis.onvoiceschanged = function() {{
+                window.speechSynthesis.onvoiceschanged = null;
+                speak();
+            }};
+            // Safety fallback: some browsers never fire onvoiceschanged
+            setTimeout(function() {{
+                if (!window.speechSynthesis.speaking) {{
+                    speak();
+                }}
+            }}, 600);
+        }}
+    }})();
+    </script>
+    """
+    st.markdown(js, unsafe_allow_html=True)
+    st.info(f"🔊 {text}")
+
+
+# ─────────────────────────────────────────────
+# FIX 2 — Auto-click the mic button
+# ─────────────────────────────────────────────
+def auto_click_mic():
+    """
+    Polls the DOM for Streamlit's audio_input mic button and clicks it.
+    Works because the user already clicked 'Ready — Record my answer',
+    satisfying the browser's user-gesture requirement for mic access.
+    """
+    js = """
+    <script>
+    (function() {
+        var attempts = 0;
+        function clickMic() {
+            attempts++;
+            if (attempts > 30) return; // give up after ~9 seconds
+
+            // Streamlit's audio_input renders a button containing an SVG mic icon.
+            // We identify it by looking for a button whose aria-label or title
+            // includes 'Record', or whose inner SVG path matches the mic shape.
+            var allButtons = Array.from(document.querySelectorAll('button'));
+            var micBtn = allButtons.find(function(b) {
+                var label = (b.getAttribute('aria-label') || '').toLowerCase();
+                var title = (b.getAttribute('title') || '').toLowerCase();
+                return label.includes('record') || title.includes('record');
+            });
+
+            // Fallback: find button with an SVG inside that is NOT a regular st.button
+            if (!micBtn) {
+                micBtn = allButtons.find(function(b) {
+                    return b.querySelector('svg') &&
+                           !b.closest('[data-testid="stButton"]');
+                });
+            }
+
+            if (micBtn) {
+                micBtn.click();
+            } else {
+                setTimeout(clickMic, 300);
+            }
+        }
+        // Give Streamlit 900ms to fully render the audio_input widget
+        setTimeout(clickMic, 900);
+    })();
+    </script>
+    """
+    st.markdown(js, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
 # UI RENDERERS
 # ─────────────────────────────────────────────
 
@@ -331,7 +427,7 @@ def render_status():
     dot_map = {
         'setup':     ('dot-idle',   'Ready to start'),
         'speaking':  ('dot-active', 'Aisha is speaking...'),
-        'listening': ('dot-listen', '🎙️ Your turn — record your answer below'),
+        'listening': ('dot-listen', '🎙️ Your turn — speak now'),
         'done':      ('dot-idle',   'Call completed ✅'),
     }
     dot, text = dot_map.get(phase, ('dot-idle', ''))
@@ -378,35 +474,6 @@ def render_summary():
     return f'<div class="summary-card"><h3>📋 Call Summary</h3>{rows}</div>'
 
 
-def play_tts(text: str):
-    """Speak text using the browser's built-in Web Speech API — zero dependencies."""
-    lang = st.session_state.call_lang
-    lang_map = {'en': 'en-US', 'hi': 'hi-IN', 'ar': 'ar-SA'}
-    bcp_lang = lang_map.get(lang, 'en-US')
-    # Escape for JS string
-    safe_text = text.replace("\\", "").replace("`", "'").replace('"', "'").replace("\n", " ")
-    js = f"""
-    <script>
-    (function() {{
-        window.speechSynthesis.cancel();
-        var u = new SpeechSynthesisUtterance(`{safe_text}`);
-        u.lang = '{bcp_lang}';
-        u.rate = 1.0;
-        u.pitch = 1.0;
-        u.volume = 1.0;
-        // Pick a voice matching the language if available
-        var voices = window.speechSynthesis.getVoices();
-        var match = voices.find(v => v.lang.startsWith('{bcp_lang[:2]}'));
-        if (match) u.voice = match;
-        window.speechSynthesis.speak(u);
-    }})();
-    </script>
-    """
-    st.markdown(js, unsafe_allow_html=True)
-    # Show text so user can read along while browser speaks
-    st.info(f"🔊 {text}")
-
-
 # ─────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────
@@ -422,7 +489,7 @@ st.markdown("""
 # MAIN APP FLOW
 # ─────────────────────────────────────────────
 
-# ── PHASE: SETUP ── enter name, then start
+# ── PHASE: SETUP ──
 if st.session_state.phase == 'setup':
     st.markdown(render_status(), unsafe_allow_html=True)
 
@@ -440,7 +507,6 @@ if st.session_state.phase == 'setup':
         st.markdown("<br>", unsafe_allow_html=True)
         name_ready = bool(st.session_state.caller_name)
         if st.button("📞 Start Call", use_container_width=True, disabled=not name_ready):
-            # Prepare first question
             q = get_question_text(0)
             add_bot_msg(q)
             st.session_state.phase = 'speaking'
@@ -454,22 +520,21 @@ if st.session_state.phase == 'setup':
             unsafe_allow_html=True
         )
 
-# ── PHASE: SPEAKING — Aisha speaks, then we wait for user mic input
+# ── PHASE: SPEAKING ──
 elif st.session_state.phase == 'speaking':
     st.markdown(render_status(), unsafe_allow_html=True)
     if st.session_state.messages:
         st.markdown(render_progress(), unsafe_allow_html=True)
         st.markdown(render_chat(), unsafe_allow_html=True)
 
-    # Play current question TTS
     q = st.session_state.current_question
     if q:
         st.markdown("**🔊 Aisha says:**")
-        play_tts(q)
+        play_tts(q)   # ← FIX 1: uses async voice loading
 
     st.markdown("""
     <div class="instruction-box">
-        🎧 Listen to Aisha above, then click <strong>▶ Move to recording</strong> when ready to speak.
+        🎧 Listen to Aisha above, then click <strong>🎙️ Ready — Record my answer</strong> when ready to speak.
     </div>
     """, unsafe_allow_html=True)
 
@@ -487,7 +552,7 @@ elif st.session_state.phase == 'speaking':
             st.session_state.finished = True
             st.rerun()
 
-# ── PHASE: LISTENING — user records via st.audio_input
+# ── PHASE: LISTENING ──
 elif st.session_state.phase == 'listening':
     st.markdown(render_status(), unsafe_allow_html=True)
     if st.session_state.messages:
@@ -496,12 +561,13 @@ elif st.session_state.phase == 'listening':
 
     st.markdown("""
     <div class="instruction-box">
-        🎙️ Click the mic below, speak your answer clearly, then click <strong>Stop</strong>.
-        Hit <strong>Submit Answer</strong> when done.
+        🎙️ Mic is opening automatically — speak your answer clearly, then click <strong>Stop</strong>.
+        Hit <strong>✅ Submit Answer</strong> when done.
     </div>
     """, unsafe_allow_html=True)
 
     audio = st.audio_input("🎤 Record your answer")
+    auto_click_mic()   # ← FIX 2: auto-opens the mic
 
     col1, col2 = st.columns(2)
 
@@ -511,13 +577,11 @@ elif st.session_state.phase == 'listening':
             step = st.session_state.step
             lang = st.session_state.call_lang
 
-            # Transcribe with Gemini
             with st.spinner("Transcribing with Gemini..."):
                 audio_bytes = audio.read()
                 transcript = transcribe_with_gemini(audio_bytes, lang)
 
             if not transcript:
-                # Retry prompt — stay in listening phase
                 sorry = SORRY[lang]
                 add_bot_msg(sorry)
                 st.session_state.current_question = sorry
@@ -526,7 +590,7 @@ elif st.session_state.phase == 'listening':
             else:
                 add_user_msg(transcript)
 
-                # ── Q0: Wrong person check ──
+                # Q0: Wrong person check
                 if step == 0 and is_negative(transcript):
                     wrong_msg = WRONG_PERSON[lang].replace(
                         "{name}", st.session_state.caller_name or "the person"
@@ -538,7 +602,7 @@ elif st.session_state.phase == 'listening':
                     st.session_state.current_question = wrong_msg
                     st.rerun()
 
-                # ── Q2: Detect preferred language ──
+                # Q2: Detect preferred language
                 if step == 2:
                     st.session_state.call_lang = detect_lang(transcript)
                     lang = st.session_state.call_lang
@@ -555,14 +619,12 @@ elif st.session_state.phase == 'listening':
                 st.session_state.step = next_step
 
                 if next_step >= 9:
-                    # All questions done
                     farewell = FAREWELL[lang]
                     add_bot_msg(farewell)
                     st.session_state.current_question = farewell
                     st.session_state.phase = 'done'
                     st.session_state.finished = True
                 else:
-                    # Next question
                     next_q = get_question_text(next_step)
                     add_bot_msg(next_q)
                     st.session_state.current_question = next_q
@@ -580,14 +642,13 @@ elif st.session_state.phase == 'listening':
             st.session_state.finished = True
             st.rerun()
 
-# ── PHASE: DONE
+# ── PHASE: DONE ──
 elif st.session_state.phase == 'done':
     st.markdown(render_status(), unsafe_allow_html=True)
     if st.session_state.messages:
         st.markdown(render_progress(), unsafe_allow_html=True)
         st.markdown(render_chat(), unsafe_allow_html=True)
 
-    # Play final TTS (farewell or wrong-person)
     final_msg = st.session_state.current_question
     if final_msg:
         st.markdown("**🔊 Aisha says:**")
