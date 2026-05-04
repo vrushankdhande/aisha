@@ -1,21 +1,8 @@
 import streamlit as st
 import io
 import base64
-import subprocess
-import sys
- 
-# ── Ensure correct Gemini SDK is installed on Streamlit Cloud ──
-try:
-    import google.genai as genai
-    from google.genai import types
-except ImportError:
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install",
-        "google-genai==1.74.0", "--quiet", "--upgrade"
-    ])
-    import google.genai as genai
-    from google.genai import types
- 
+from google import genai
+from google.genai import types
 from gtts import gTTS
  
 
