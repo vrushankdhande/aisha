@@ -10,15 +10,13 @@ Flow per question:
 
 Deploy on Streamlit Cloud:
   - Add GEMINI_API_KEY to App Settings → Secrets
-  - requirements.txt needs: streamlit, google-genai, gTTS
+  - requirements.txt: streamlit, google-generativeai, gTTS
 """
 
 import io, base64, os
 import streamlit as st
 import streamlit.components.v1 as components
-from google import genai
-from google.genai import types
-from gtts import gTTS
+import google.generativeai as genai
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -72,7 +70,7 @@ html,body,[class*="css"]{font-family:'DM Sans',sans-serif;background-color:#0d11
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API KEY  (set in Streamlit Cloud → Settings → Secrets as GEMINI_API_KEY)
+# API KEY  (Streamlit Cloud → Settings → Secrets → GEMINI_API_KEY = "...")
 # ─────────────────────────────────────────────────────────────────────────────
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
@@ -83,9 +81,10 @@ if not GEMINI_API_KEY:
     st.error("⚠️ GEMINI_API_KEY missing. Add it to Streamlit Cloud → App Settings → Secrets.")
     st.stop()
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
-RECORD_SECONDS = 5   # seconds of mic recording per turn
+RECORD_SECONDS = 5
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONTENT
@@ -164,8 +163,8 @@ def init_state():
         'status_text': 'Ready to start',
         'caller_name': '',
         'retry_count': 0,
-        'component_key': 0,          # incremented each turn to force re-render
-        'retry_tts_text': '',        # text spoken on retry turns
+        'component_key': 0,
+        'retry_tts_text': '',
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -177,7 +176,7 @@ init_state()
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def make_tts_b64(text: str, lang: str) -> str:
-    """Convert text to gTTS MP3 and return as base64 string."""
+    from gtts import gTTS
     clean = (text.replace("*","").replace("#","").replace("`","")
                  .replace("\n"," ").replace("  "," ").strip())
     buf = io.BytesIO()
@@ -186,25 +185,30 @@ def make_tts_b64(text: str, lang: str) -> str:
     return base64.b64encode(buf.read()).decode()
 
 def transcribe(audio_b64: str, lang: str) -> str:
-    """Send base64 audio to Gemini and return transcript."""
     lang_hint = {'en':'English','hi':'Hindi','ar':'Arabic'}.get(lang,'English')
     prompt = (
         f"The user is speaking in {lang_hint}. "
         "Transcribe exactly as spoken. Return ONLY the transcript text. "
-        "If silent or inaudible, return an empty string."
+        "If the audio is silent or inaudible, return an empty string."
     )
     audio_bytes = base64.b64decode(audio_b64)
-    audio_part  = types.Part.from_bytes(data=audio_bytes, mime_type="audio/webm")
+
+    # Upload audio bytes as a file-like object to Gemini
+    import tempfile, pathlib
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+
     try:
-        r = gemini_client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[prompt, audio_part],
-        )
-        t = r.text.strip()
+        audio_file = genai.upload_file(tmp_path, mime_type="audio/webm")
+        response   = gemini_model.generate_content([prompt, audio_file])
+        t = response.text.strip()
         return "" if len(t) < 2 or t.lower().startswith("i cannot") else t
     except Exception as e:
         st.error(f"Transcription error: {e}")
         return ""
+    finally:
+        os.unlink(tmp_path)
 
 def detect_lang(text: str):
     lo = text.lower()
@@ -217,7 +221,6 @@ def add_bot(text):  st.session_state.messages.append({'role':'bot', 'text':text}
 def add_user(text): st.session_state.messages.append({'role':'user','text':text})
 
 def play_once(text: str, lang: str):
-    """Play TTS without recording — used for ack/farewell between steps."""
     b64 = make_tts_b64(text, lang)
     components.html(
         f'<audio autoplay src="data:audio/mp3;base64,{b64}"></audio>',
@@ -257,9 +260,8 @@ def render_chat():
                      f'<div class="avatar">👤</div>'
                      f'<div class="bubble"><div class="label">YOU</div>{m["text"]}</div>'
                      f'</div>')
-    html += ('</div>'
-             '<script>var c=document.getElementById("chatbox");'
-             'if(c)c.scrollTop=c.scrollHeight;</script>')
+    html += ('<script>var c=document.getElementById("chatbox");'
+             'if(c)c.scrollTop=c.scrollHeight;</script></div>')
     return html
 
 def render_summary():
@@ -272,81 +274,32 @@ def render_summary():
     return f'<div class="summary-card"><h3>📋 Call Summary</h3>{rows}</div>'
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE AUTO VOICE COMPONENT
+# AUTO VOICE COMPONENT  (speak → auto-record → return audio)
 # ─────────────────────────────────────────────────────────────────────────────
 def auto_voice_turn(tts_audio_b64: str, record_seconds: int, key: int):
-    """
-    Renders a self-contained HTML component that:
-      1. Autoplays TTS audio
-      2. After TTS ends, automatically records mic for `record_seconds`
-      3. Returns the recorded audio as a base64 string via Streamlit component value
-
-    The component communicates back via window.parent.postMessage with
-    type='streamlit:setComponentValue', which is Streamlit's official
-    bi-directional component protocol.
-    """
-
-    html = f"""
-<!DOCTYPE html>
-<html>
-<head>
+    html = f"""<!DOCTYPE html><html><head>
 <style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    background: transparent;
-    padding: 8px 0;
-    font-family: 'DM Sans', 'Segoe UI', sans-serif;
-  }}
-  #panel {{
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 10px;
-    padding: 10px 16px;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }}
-  #dot {{
-    width: 12px; height: 12px;
-    border-radius: 50%;
-    background: #58a6ff;
-    flex-shrink: 0;
-    animation: blink 1.2s infinite;
-  }}
-  @keyframes blink {{ 0%,100%{{opacity:1}} 50%{{opacity:.2}} }}
-  #lbl {{ color: #e6edf3; font-size: 0.85rem; flex: 1; }}
-  #bar {{
-    width: 120px; height: 5px;
-    background: #21262d;
-    border-radius: 3px;
-    overflow: hidden;
-    flex-shrink: 0;
-  }}
-  #fill {{
-    height: 100%;
-    width: 0%;
-    background: linear-gradient(90deg, #1f6feb, #3fb950);
-    border-radius: 3px;
-    transition: width 0.15s linear;
-  }}
-</style>
-</head>
-<body>
+*{{box-sizing:border-box;margin:0;padding:0;}}
+body{{background:transparent;padding:8px 0;font-family:'DM Sans','Segoe UI',sans-serif;}}
+#panel{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:10px 16px;display:flex;align-items:center;gap:12px;}}
+#dot{{width:12px;height:12px;border-radius:50%;background:#58a6ff;flex-shrink:0;animation:blink 1.2s infinite;}}
+@keyframes blink{{0%,100%{{opacity:1}}50%{{opacity:.2}}}}
+#lbl{{color:#e6edf3;font-size:0.85rem;flex:1;}}
+#bar{{width:120px;height:5px;background:#21262d;border-radius:3px;overflow:hidden;flex-shrink:0;}}
+#fill{{height:100%;width:0%;background:linear-gradient(90deg,#1f6feb,#3fb950);border-radius:3px;transition:width 0.15s linear;}}
+</style></head><body>
 <div id="panel">
   <div id="dot"></div>
   <div id="lbl">🔊 Aisha is speaking...</div>
   <div id="bar"><div id="fill"></div></div>
 </div>
-
 <script>
 const RECORD_MS = {record_seconds * 1000};
 const TTS_B64   = `{tts_audio_b64}`;
-
-const lbl  = document.getElementById('lbl');
-const dot  = document.getElementById('dot');
+const lbl = document.getElementById('lbl');
+const dot = document.getElementById('dot');
 const fill = document.getElementById('fill');
 
-// ── Send audio back to Streamlit Python ──────────────────────────────────────
 function returnValue(b64) {{
   window.parent.postMessage({{
     isStreamlitMessage: true,
@@ -355,18 +308,17 @@ function returnValue(b64) {{
   }}, '*');
 }}
 
-// ── Record mic for RECORD_MS then return base64 ──────────────────────────────
 async function recordMic() {{
-  dot.style.background  = '#f78166';
-  dot.style.animation   = 'blink 0.7s infinite';
-  lbl.textContent       = '🎙️ Listening... speak now';
-  fill.style.width      = '0%';
+  dot.style.background = '#f78166';
+  dot.style.animation  = 'blink 0.7s infinite';
+  lbl.textContent      = '🎙️ Listening... speak now';
+  fill.style.width     = '0%';
 
   let stream;
   try {{
     stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
-  }} catch (err) {{
-    lbl.textContent      = '❌ Microphone access denied — please allow in browser settings';
+  }} catch(err) {{
+    lbl.textContent     = '❌ Mic denied — please allow microphone access and refresh';
     dot.style.background = '#ff6b6b';
     dot.style.animation  = 'none';
     return;
@@ -374,15 +326,14 @@ async function recordMic() {{
 
   const recorder = new MediaRecorder(stream, {{ mimeType: 'audio/webm' }});
   const chunks   = [];
-  recorder.ondataavailable = e => {{ if (e.data.size > 0) chunks.push(e.data); }};
-
+  recorder.ondataavailable = e => {{ if(e.data.size > 0) chunks.push(e.data); }};
   recorder.onstop = () => {{
     stream.getTracks().forEach(t => t.stop());
-    const blob   = new Blob(chunks, {{ type: 'audio/webm' }});
+    const blob   = new Blob(chunks, {{ type:'audio/webm' }});
     const reader = new FileReader();
     reader.onload = () => {{
       const b64 = reader.result.split(',')[1];
-      lbl.textContent      = '⏳ Processing your response...';
+      lbl.textContent      = '⏳ Processing...';
       dot.style.background = '#58a6ff';
       dot.style.animation  = 'blink 1.2s infinite';
       fill.style.width     = '100%';
@@ -392,62 +343,41 @@ async function recordMic() {{
   }};
 
   recorder.start(200);
-
-  // Countdown progress bar
   const t0 = Date.now();
   const timer = setInterval(() => {{
     const elapsed = Date.now() - t0;
     const pct     = Math.min((elapsed / RECORD_MS) * 100, 100);
     fill.style.width = pct + '%';
     const rem = Math.max(0, Math.ceil((RECORD_MS - elapsed) / 1000));
-    lbl.textContent  = `🎙️ Listening... ${{rem}}s`;
-    if (elapsed >= RECORD_MS) {{
-      clearInterval(timer);
-      recorder.stop();
-    }}
+    lbl.textContent = `🎙️ Listening... ${{rem}}s`;
+    if(elapsed >= RECORD_MS) {{ clearInterval(timer); recorder.stop(); }}
   }}, 150);
 }}
 
-// ── Play TTS then record ──────────────────────────────────────────────────────
 async function run() {{
-  // Signal Streamlit we're alive (value=null means "not done yet")
-  window.parent.postMessage({{
-    isStreamlitMessage: true,
-    type: 'streamlit:setComponentValue',
-    value: null,
-  }}, '*');
+  // Signal "not done yet"
+  window.parent.postMessage({{ isStreamlitMessage:true, type:'streamlit:setComponentValue', value:null }}, '*');
 
-  if (TTS_B64) {{
-    const audio = new Audio('data:audio/mp3;base64,' + TTS_B64);
+  if(TTS_B64) {{
     dot.style.background = '#3fb950';
     lbl.textContent      = '🔊 Aisha is speaking...';
-
+    const audio = new Audio('data:audio/mp3;base64,' + TTS_B64);
     await new Promise(resolve => {{
       audio.onended = resolve;
       audio.onerror = resolve;
-      // Some browsers block autoplay — retry with user-gesture unlock
-      const playPromise = audio.play();
-      if (playPromise !== undefined) {{
-        playPromise.catch(() => {{
-          // If blocked, show a tap-to-play note (only happens first load)
-          lbl.textContent = '🔊 Tap anywhere to unmute and hear Aisha...';
-          document.addEventListener('click', () => {{ audio.play(); }}, {{ once: true }});
-        }});
-      }}
+      const p = audio.play();
+      if(p) p.catch(() => {{
+        lbl.textContent = '🔊 Click anywhere to unmute, then Aisha will speak...';
+        document.addEventListener('click', () => audio.play(), {{ once:true }});
+      }});
     }});
   }}
-
   await recordMic();
 }}
-
 run();
-</script>
-</body>
-</html>
-"""
-    # The component returns a value when JS calls setComponentValue
-    # key= forces a full re-render each new turn
-    return components.html(html, height=72, key=f"voice_turn_{key}")
+</script></body></html>"""
+
+    return components.html(html, height=72, key=f"vt_{key}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -461,15 +391,11 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PLACEHOLDERS
-# ─────────────────────────────────────────────────────────────────────────────
 status_ph   = st.empty()
 progress_ph = st.empty()
 chat_ph     = st.empty()
 summary_ph  = st.empty()
 
-# Always show current state
 status_ph.markdown(render_status(), unsafe_allow_html=True)
 if st.session_state.messages:
     progress_ph.markdown(render_progress(), unsafe_allow_html=True)
@@ -478,18 +404,16 @@ if st.session_state.finished:
     summary_ph.markdown(render_summary(), unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONTROLS  (name input / start / end call)
+# CONTROLS
 # ─────────────────────────────────────────────────────────────────────────────
 col1, col2 = st.columns(2)
 
 with col1:
     if not st.session_state.started and not st.session_state.finished:
-        name_in = st.text_input(
-            "👤 Person's name to call",
-            value=st.session_state.caller_name,
-            placeholder="e.g. Alia, Riya, Sara...",
-            max_chars=40,
-        )
+        name_in = st.text_input("👤 Person's name to call",
+                                value=st.session_state.caller_name,
+                                placeholder="e.g. Alia, Riya, Sara...",
+                                max_chars=40)
         st.session_state.caller_name = name_in.strip()
         ready = bool(st.session_state.caller_name)
 
@@ -518,9 +442,9 @@ with col2:
             st.session_state.finished    = True
             st.session_state.status      = 'idle'
             st.session_state.status_text = 'Call ended by user'
-            status_ph.markdown(render_status(),   unsafe_allow_html=True)
-            chat_ph.markdown(render_chat(),        unsafe_allow_html=True)
-            summary_ph.markdown(render_summary(), unsafe_allow_html=True)
+            status_ph.markdown(render_status(),    unsafe_allow_html=True)
+            chat_ph.markdown(render_chat(),         unsafe_allow_html=True)
+            summary_ph.markdown(render_summary(),  unsafe_allow_html=True)
             play_once(farewell, lang)
             st.stop()
 
@@ -533,40 +457,37 @@ if not st.session_state.started or st.session_state.finished:
 step = st.session_state.step
 lang = st.session_state.call_lang
 
-# ── All questions answered ─────────────────────────────────────────────────
+# All questions done → farewell
 if step >= 9:
     farewell = FAREWELL[lang]
     add_bot(farewell)
     st.session_state.finished    = True
     st.session_state.status      = 'idle'
     st.session_state.status_text = 'Call completed ✅'
-    status_ph.markdown(render_status(),   unsafe_allow_html=True)
+    status_ph.markdown(render_status(),    unsafe_allow_html=True)
     progress_ph.markdown(render_progress(), unsafe_allow_html=True)
-    chat_ph.markdown(render_chat(),        unsafe_allow_html=True)
-    summary_ph.markdown(render_summary(), unsafe_allow_html=True)
+    chat_ph.markdown(render_chat(),         unsafe_allow_html=True)
+    summary_ph.markdown(render_summary(),  unsafe_allow_html=True)
     play_once(farewell, lang)
     st.stop()
 
-# ── Decide what to speak this turn ────────────────────────────────────────
+# Decide what to speak
 if st.session_state.retry_count == 0:
-    # Fresh question
-    speak_text = QUESTIONS[lang][step].replace(
-        "{name}", st.session_state.caller_name or "you"
-    )
-    if not any(m['text'] == speak_text for m in reversed(st.session_state.messages[-2:])):
+    speak_text = QUESTIONS[lang][step].replace("{name}", st.session_state.caller_name or "you")
+    # Only add to chat if not already the last bot message
+    if not st.session_state.messages or st.session_state.messages[-1].get('text') != speak_text:
         add_bot(speak_text)
 else:
-    # Retry — speak the retry/sorry message stored in state
     speak_text = st.session_state.retry_tts_text
 
-# ── Update status bar ────────────────────────────────────────────────────
+# Update status
 st.session_state.status      = 'listening'
 st.session_state.status_text = f'🎙️ Auto-listening after Aisha speaks... (Q{step+1}/9)'
-status_ph.markdown(render_status(),   unsafe_allow_html=True)
+status_ph.markdown(render_status(),    unsafe_allow_html=True)
 progress_ph.markdown(render_progress(), unsafe_allow_html=True)
-chat_ph.markdown(render_chat(),        unsafe_allow_html=True)
+chat_ph.markdown(render_chat(),         unsafe_allow_html=True)
 
-# ── Render the auto-speak + auto-record component ─────────────────────────
+# Render auto-voice component
 tts_b64_str = make_tts_b64(speak_text, lang)
 received    = auto_voice_turn(
     tts_audio_b64=tts_b64_str,
@@ -574,20 +495,18 @@ received    = auto_voice_turn(
     key=st.session_state.component_key,
 )
 
-# ── Process returned audio ─────────────────────────────────────────────────
-# received is None until JS calls setComponentValue with the base64 audio
+# Wait for audio
 if not received or not isinstance(received, str) or len(received) < 200:
-    # Still waiting for audio — Streamlit will rerun when value arrives
     st.stop()
 
-# ── Transcribe ────────────────────────────────────────────────────────────
+# Transcribe
 st.session_state.status      = 'speaking'
 st.session_state.status_text = 'Processing your response...'
 status_ph.markdown(render_status(), unsafe_allow_html=True)
 
 user_input = transcribe(received, lang)
 
-# ── STEP 2: Language preference ───────────────────────────────────────────
+# ── STEP 2: Language preference ───────────────────────────────────────────────
 if step == 2:
     detected = detect_lang(user_input) if user_input else None
     if detected is None:
@@ -610,15 +529,13 @@ if step == 2:
         st.session_state.component_key += 1
         st.rerun()
 
-# ── STEP 0: Wrong person check ────────────────────────────────────────────
+# ── STEP 0: Wrong person ──────────────────────────────────────────────────────
 elif step == 0 and user_input:
     neg = ["no","nope","nahi","nahin","नहीं","نه","لا",
            "wrong","not me","wrong number","wrong person"]
     if any(w in user_input.lower() for w in neg):
         add_user(user_input)
-        wrong = WRONG_PERSON[lang].replace(
-            "{name}", st.session_state.caller_name or "the person"
-        )
+        wrong = WRONG_PERSON[lang].replace("{name}", st.session_state.caller_name or "the person")
         add_bot(wrong)
         st.session_state.collected["Name Confirmed"] = "No — Wrong person"
         st.session_state.finished    = True
@@ -640,7 +557,7 @@ elif step == 0 and user_input:
         st.session_state.component_key += 1
         st.rerun()
 
-# ── All other steps ───────────────────────────────────────────────────────
+# ── All other steps ───────────────────────────────────────────────────────────
 else:
     if not user_input:
         if st.session_state.retry_count < 1:
@@ -651,7 +568,6 @@ else:
             st.session_state.component_key += 1
             st.rerun()
         else:
-            # Give up on this question, move on
             st.session_state.collected[QUESTION_LABELS[step]] = "—"
             st.session_state.step          += 1
             st.session_state.retry_count    = 0
