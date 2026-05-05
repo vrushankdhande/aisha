@@ -1,11 +1,6 @@
 import streamlit as st
 import io
-import time
-import tempfile
-import os
-import numpy as np
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 from gtts import gTTS
 
 # ─────────────────────────────────────────────
@@ -159,7 +154,11 @@ try:
 except Exception:
     GEMINI_API_KEY = ""
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+else:
+    gemini_model = None
 
 # ─────────────────────────────────────────────
 # CONSTANTS
@@ -259,8 +258,8 @@ def text_to_speech_bytes(text: str, lang: str) -> bytes:
 
 
 def transcribe_with_gemini(audio_bytes: bytes, mime_type: str, lang: str) -> str:
-    """Transcribe uploaded audio via Gemini Flash."""
-    if gemini_client is None:
+    """Transcribe uploaded audio via Gemini 1.5 Flash."""
+    if gemini_model is None:
         return ""
     lang_hint = {'en': 'English', 'hi': 'Hindi', 'ar': 'Arabic'}.get(lang, 'English')
     prompt = (
@@ -269,12 +268,9 @@ def transcribe_with_gemini(audio_bytes: bytes, mime_type: str, lang: str) -> str
         "Return ONLY the transcript text with no extra commentary. "
         "If the audio is silent or inaudible return an empty string."
     )
-    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+    audio_part = {"mime_type": mime_type, "data": audio_bytes}
     try:
-        response = gemini_client.models.generate_content(
-            model="gemini-1.5-flash",          # correct stable model name
-            contents=[prompt, audio_part],
-        )
+        response = gemini_model.generate_content([prompt, audio_part])
         transcript = response.text.strip()
         if len(transcript) < 2 or transcript.lower().startswith("i cannot"):
             return ""
